@@ -1,7 +1,10 @@
-import os
+ import os
+from pyexpat import model
 import unittest
 import logging
 import vtk, qt, ctk, slicer
+import math
+import numpy
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 
@@ -10,353 +13,497 @@ from slicer.util import VTKObservationMixin
 #
 
 class Trajectory(ScriptedLoadableModule):
-  """Uses ScriptedLoadableModule base class, available at:
-  https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
-  """
 
   def __init__(self, parent):
     ScriptedLoadableModule.__init__(self, parent)
     self.parent.title = "Trajectory"  
-    self.parent.categories = ["Infomatics"] 
-    self.parent.dependencies = []  
-    self.parent.contributors = ["Ajay (Alpha Corp.)"]  
+    self.parent.categories = ["Informatics"]  
+    self.parent.dependencies = ["CurveMaker"]  
+    self.parent.contributors = ["Xyz (Alpha Corp.)"]  
     self.parent.helpText = """
-    the module to mark a trajectory for needle incision during surgery.
-     """
+    This extension helps us to mark trajectory for needle incision.
+    See more information in <a href="https://github.com/ajaykumarsahu0505/Slicer3D/tree/main/Trajectory%20mapper">module documentation</a>."""
+    
     self.parent.acknowledgementText = """
-This file was originally developed by 
-"""
-
-    # Additional initialization step after application startup is complete
-    slicer.app.connect("startupCompleted()", registerSampleData)
+    
+    """
 
 #
 # TrajectoryWidget
 #
 
 class TrajectoryWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
-  """Uses ScriptedLoadableModuleWidget base class, available at:
-  https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
-  """
 
-  def __init__(self, parent= None):
-    """
-    Called when the user opens the module the first time and the widget is initialized.
-    """
+  def __init__(self, parent=None):
     ScriptedLoadableModuleWidget.__init__(self, parent)
-    VTKObservationMixin.__init__(self)  # needed for parameter node observation
+    VTKObservationMixin.__init__(self)  
     self.logic = None
     self._parameterNode = None
     self._updatingGUIFromParameterNode = False
 
   def setup(self):
-    """
-    Called when the user opens the module the first time and the widget is initialized.
-    """
+    # UI connection
     ScriptedLoadableModuleWidget.setup(self)
-
-    # Load widget from .ui file (created by Qt Designer).
-    # Additional widgets can be instantiated manually and added to self.layout.
-    uiWidget = slicer.util.loadUI(self.resourcePath('UI/Trajectory.ui'))
+    uiWidget = slicer.util.loadUI(self.resourcePath('UI/Trajectory.ui'))  
     self.layout.addWidget(uiWidget)
     self.ui = slicer.util.childWidgetVariables(uiWidget)
 
-    # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
-    # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
-    # "setMRMLScene(vtkMRMLScene*)" slot.
     uiWidget.setMRMLScene(slicer.mrmlScene)
 
-    # Create logic class. Logic implements all computations that should be possible to run
-    # in batch mode, without a graphical user interface.
     self.logic = TrajectoryLogic()
 
-    # Connections
+    self.tagPlanNode = None
+    self.tagPathNode = None
+    self.targetFiducialsNode = None
+    self.tagDestinationDispNode = None
+    self.prevFiducialNode= None
+    self.prevModelNode= None
 
-    # These connections ensure that we update parameter node when scene is closed
-    self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
-    self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
+    self.ui.VisiblityButton.checked= self.logic.SliceVisibility
 
-    # These connections ensure that whenever user changes some settings on the GUI, that is saved in the MRML scene
-    # (in the selected parameter node).
-    self.ui.inputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
-    self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
-    self.ui.imageThresholdSliderWidget.connect("valueChanged(double)", self.updateParameterNodeFromGUI)
-    self.ui.invertOutputCheckBox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
-    self.ui.invertedOutputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.updateParameterNodeFromGUI)
-
-    # Buttons
-    self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
-
-    # Make sure parameter node is initialized (needed for module reload)
-    self.initializeParameterNode()
+    #Model Node 
+    self.ModelSelector = slicer.qMRMLNodeComboBox()
+    self.ModelSelector.nodeTypes=(("vtkMRMLModelNode"), "")
+    self.ModelSelector.baseName=("Path")
+    self.ModelSelector.selectNodeUponCreation = True
+    self.ModelSelector.showChildNodeTypes = False
+    self.ModelSelector.setMRMLScene( slicer.mrmlScene )
+  
+    #UI Connections
+    self.ui.Planselector.connect("currentNodeChanged(vtkMRMLNode*)", self.onPlanselector)
+    self.ui.VisiblityButton.connect('toggled(bool)',self.onVisiblityButton)
+    self.ui.EntryPointButton.connect('clicked(bool)', self.onEntryPointButton)
+    self.ui.TargetPointButton.connect('clicked(bool)', self.onTargetPointButton)
+    self.ui.TargetPointJumpSlicesButton.connect('clicked(bool)', self.onTargetJumpSlicesButton)
+    self.ui.EntryPointJumpSlicesButton.connect('clicked(bool)', self.onEntryJumpSlicesButton)
+    self.ui.VolumeReslicerButton.connect('clicked(bool)', self.onVolumereSlicer)
+    self.ui.RadiusSliderWidget.connect("valueChanged(double)", self.onTubeUpdated)
+    self.ui.lengthLineEdit.connect("currentNodeChanged(vtkMRMLNode*)", self.onlengthLineEdit)
 
   def cleanup(self):
-    """
-    Called when the application closes and the module widget is destroyed.
-    """
-    self.removeObservers()
+    pass
 
-  def enter(self):
-    """
-    Called each time the user opens this module.
-    """
-    # Make sure parameter node exists and observed
-    self.initializeParameterNode()
+  def onPlanselector(self):
+    #Check and hide the Fiducial markers and model
+    if (self.prevFiducialNode != None and self.prevModelNode!= None):
+      self.prevModelNode.SetDisplayVisibility(0)
 
-  def exit(self):
-    """
-    Called each time the user opens a different module.
-    """
-    # Do not react to parameter node changes (GUI wlil be updated when the user enters into the module)
-    self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
+    
+    if (self.prevFiducialNode != None):
+      self.logic.setVolumeReslicer(False)
+      self.ui.VolumeReslicerButton.checked= False
+      self.prevFiducialNode.SetDisplayVisibility(0)
 
-  def onSceneStartClose(self, caller, event):
-    """
-    Called just before the scene is closed.
-    """
-    # Parameter node will be reset, do not use it anymore
-    self.setParameterNode(None)
+    # Remove observer if previous node exists
+    if self.logic.PlanNode and self.tagPlanNode:
+      self.logic.PlanNode.RemoveObserver(self.tagPlanNode)
 
-  def onSceneEndClose(self, caller, event):
-    """
-    Called just after the scene is closed.
-    """
-    # If this module is shown while the scene is closed then recreate a new parameter node immediately
-    if self.parent.isEntered:
-      self.initializeParameterNode()
+    # Update selected node, add observer, and update control points
+    if self.ui.Planselector.currentNode():
+      self.logic.PlanNode = self.ui.Planselector.currentNode()
 
-  def initializeParameterNode(self):
-    """
-    Ensure parameter node exists and observed.
-    """
-    # Parameter node stores all user choices in parameter values, node selections, etc.
-    # so that when the scene is saved and reloaded, these settings are restored.
+      # Check if model has already been generated with for this fiducial list
+      tubeModelID = self.logic.PlanNode.GetAttribute('Trajectory.Plan')
+      self.ModelSelector.setCurrentNodeID(tubeModelID)
+      self.tagPlanNode = self.logic.PlanNode.AddObserver(slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self.logic.controlPointsUpdated, 2)
+    
+    # Set the visibility of current node
+    if (self.ui.Planselector.currentNode() != None and self.ModelSelector.currentNode() != None):
+      self.ui.Planselector.currentNode().SetDisplayVisibility(1)
+      self.ModelSelector.currentNode().SetDisplayVisibility(1)
 
-    self.setParameterNode(self.logic.getParameterNode())
-
-    # Select default input nodes if nothing is selected yet to save a few clicks for the user
-    if not self._parameterNode.GetNodeReference("InputVolume"):
-      firstVolumeNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-      if firstVolumeNode:
-        self._parameterNode.SetNodeReferenceID("InputVolume", firstVolumeNode.GetID())
-
-  def setParameterNode(self, inputParameterNode):
-    """
-    Set and observe parameter node.
-    Observation is needed because when the parameter node is changed then the GUI must be updated immediately.
-    """
-
-    if inputParameterNode:
-      self.logic.setDefaultParameters(inputParameterNode)
-
-    # Unobserve previously selected parameter node and add an observer to the newly selected.
-    # Changes of parameter node are observed so that whenever parameters are changed by a script or any other module
-    # those are reflected immediately in the GUI.
-    if self._parameterNode is not None:
-      self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
-    self._parameterNode = inputParameterNode
-    if self._parameterNode is not None:
-      self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
-
-    # Initial GUI update
-    self.updateGUIFromParameterNode()
-
-  def updateGUIFromParameterNode(self, caller=None, event=None):
-    """
-    This method is called whenever parameter node is changed.
-    The module GUI is updated to show the current state of the parameter node.
-    """
-
-    if self._parameterNode is None or self._updatingGUIFromParameterNode:
-      return
-
-    # Make sure GUI changes do not call updateParameterNodeFromGUI (it could cause infinite loop)
-    self._updatingGUIFromParameterNode = True
-
-    # Update node selectors and sliders
-    self.ui.inputSelector.setCurrentNode(self._parameterNode.GetNodeReference("InputVolume"))
-    self.ui.outputSelector.setCurrentNode(self._parameterNode.GetNodeReference("OutputVolume"))
-    self.ui.invertedOutputSelector.setCurrentNode(self._parameterNode.GetNodeReference("OutputVolumeInverse"))
-    self.ui.imageThresholdSliderWidget.value = float(self._parameterNode.GetParameter("Threshold"))
-    self.ui.invertOutputCheckBox.checked = (self._parameterNode.GetParameter("Invert") == "true")
-
-    # Update buttons states and tooltips
-    if self._parameterNode.GetNodeReference("InputVolume") and self._parameterNode.GetNodeReference("OutputVolume"):
-      self.ui.applyButton.toolTip = "Compute output volume"
-      self.ui.applyButton.enabled = True
+    # Update checkbox
+    if (self.ui.Planselector.currentNode() == None or self.ModelSelector.currentNode() == None):
+      self.ui.EntryPointButton.enabled = True
+      self.ui.TargetPointButton.enabled = True
     else:
-      self.ui.applyButton.toolTip = "Select input and output volume nodes"
-      self.ui.applyButton.enabled = False
+      self.logic.PlanNode.SetAttribute('Trajectory.Plan',self.logic.PathNode.GetID())
+      self.logic.updateCurve()
+    self.prevFiducialNode= self.ui.Planselector.currentNode()
+    self.prevModelNode= self.ModelSelector.currentNode()
 
-    # All the GUI updates are done
-    self._updatingGUIFromParameterNode = False
 
-  def updateParameterNodeFromGUI(self, caller=None, event=None):
-    """
-    This method is called when the user makes any change in the GUI.
-    The changes are saved into the parameter node (so that they are restored when the scene is saved and loaded).
-    """
+  def onVisiblityButton(self, state):
+    # Visibility of the model in slices
+    self.logic.SliceVisibility= state
+    modelDisplayNode = self.ModelSelector.currentNode().GetDisplayNode()
+    if self.logic.SliceVisibility:
+      modelDisplayNode.SetVisibility2D(True)
+    else:
+      modelDisplayNode.SetVisibility2D(False)
 
-    if self._parameterNode is None or self._updatingGUIFromParameterNode:
-      return
+  def onEntryPointButton(self):
+    # Entry point placement
+    plan1 = self.ui.Planselector.currentNode()
+    slicer.modules.markups.logic().StartPlaceMode(0)
+    self.entryID= (plan1.GetNumberOfFiducials())
+    plan1.AddObserver(slicer.vtkMRMLMarkupsNode.PointAddedEvent, self.onEntryMarkupChanged)
+    print(self.entryID)
+    if self.entryID==1:
+      self.onModelselector()
+    self.logic.entryID= self.entryID
 
-    wasModified = self._parameterNode.StartModify()  # Modify all properties in a single batch
+  def onEntryMarkupChanged(self, caller, event):
+    # set label for entry point
+    plan1= caller
+    plan1.SetNthFiducialLabel(self.entryID,"Entry Point")
+    self.ui.EntryPointButton.enabled = False
 
-    self._parameterNode.SetNodeReferenceID("InputVolume", self.ui.inputSelector.currentNodeID)
-    self._parameterNode.SetNodeReferenceID("OutputVolume", self.ui.outputSelector.currentNodeID)
-    self._parameterNode.SetParameter("Threshold", str(self.ui.imageThresholdSliderWidget.value))
-    self._parameterNode.SetParameter("Invert", "true" if self.ui.invertOutputCheckBox.checked else "false")
-    self._parameterNode.SetNodeReferenceID("OutputVolumeInverse", self.ui.invertedOutputSelector.currentNodeID)
+  def onTargetPointButton(self):
+    # Target point placement
+    plan1 = self.ui.Planselector.currentNode()
+    slicer.modules.markups.logic().StartPlaceMode(0)
+    self.targetID= (plan1.GetNumberOfFiducials())
+    plan1.AddObserver(slicer.vtkMRMLMarkupsNode.PointAddedEvent, self.onTargetMarkupChanged)
+    print(self.targetID)
+    if self.targetID==1:
+      self.onModelselector()
+    self.logic.targetID= self.targetID
 
-    self._parameterNode.EndModify(wasModified)
+  def onTargetMarkupChanged(self, caller, event):
+    # sets label for target point
+    plan1= caller
+    plan1.SetNthFiducialLabel(self.targetID,"Target Point")
+    self.ui.TargetPointButton.enabled = False
 
-  def onApplyButton(self):
-    """
-    Run processing when user clicks "Apply" button.
-    """
-    try:
 
-      # Compute output
-      self.logic.process(self.ui.inputSelector.currentNode(), self.ui.outputSelector.currentNode(),
-        self.ui.imageThresholdSliderWidget.value, self.ui.invertOutputCheckBox.checked)
+  def onEntryJumpSlicesButton(self):
+    # Jumps the entry points to slices
+    self.logic.setJumpToEntryPoint()
 
-      # Compute inverted output (if needed)
-      if self.ui.invertedOutputSelector.currentNode():
-        # If additional output volume is selected then result with inverted threshold is written there
-        self.logic.process(self.ui.inputSelector.currentNode(), self.ui.invertedOutputSelector.currentNode(),
-          self.ui.imageThresholdSliderWidget.value, not self.ui.invertOutputCheckBox.checked, showResult=False)
+  def onTargetJumpSlicesButton(self):
+    # Jumps the target point to slices
+    self.logic.setJumpToTargetPoint()
+    
 
-    except Exception as e:
-      slicer.util.errorDisplay("Failed to compute results: "+str(e))
-      import traceback
-      traceback.print_exc()
+  def onVolumereSlicer(self, state):
+    self.logic.setVolumeReslicer(state)
+
+  def onModelselector(self):
+    # Create a new node for model
+    self.model=self.ModelSelector.addNode("vtkMRMLModelNode")
+    if self.logic.PathNode and self.tagPathNode:
+      self.logic.PathNode.RemoveObserver(self.tagPathNode)
+      if self.logic.PathNode.GetDisplayNode() and self.tagDestinationDispNode:
+        self.logic.PathNode.GetDisplayNode().RemoveObserver(self.tagDestinationDispNode)
+    
+    # Update destination node
+    if self.ModelSelector.currentNode():
+      self.logic.PathNode = self.ModelSelector.currentNode()
+      self.tagPathNode = self.logic.PathNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onModelModifiedEvent)
+
+      if self.logic.PathNode.GetDisplayNode():
+        self.tagDestinationDispNode = self.logic.PathNode.GetDisplayNode().AddObserver(vtk.vtkCommand.ModifiedEvent, self.onModelDisplayModifiedEvent)
+
+    # Update checkbox
+    if (self.ui.Planselector.currentNode() != None and self.ModelSelector.currentNode() != None):
+      self.logic.PlanNode.SetAttribute('Trajectory.Plan',self.logic.PathNode.GetID())
+      self.logic.updateCurve()
+
+  def onTubeUpdated(self):
+    #Path Radius
+    self.logic.setTubeRadius(self.ui.RadiusSliderWidget.value)
+
+  def onModelModifiedEvent(self, caller, event):
+    self.ui.lengthLineEdit.text = '%.2f' % self.logic.CurveLength
+
+  def onlengthLineEdit(self):
+    self.ui.lengthLineEdit.text = '%.2f' % self.logic.CurveLength
 
 
 #
-# TrajectoryLogic
+# Logic
 #
 
-class TrajectoryLogic(ScriptedLoadableModuleLogic):
-  """This class should implement all the actual
-  computation done by your module.  The interface
-  should be such that other python code can import
-  this class and make use of the functionality without
-  requiring an instance of the Widget.
-  Uses ScriptedLoadableModuleLogic base class, available at:
-  https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
-  """
+class TrajectoryLogic:
 
   def __init__(self):
-    """
-    Called when the logic class is instantiated. Can be used for initializing member variables.
-    """
-    ScriptedLoadableModuleLogic.__init__(self)
+    self.PlanNode = None
+    self.PathNode = None
+    self.TubeRadius = 2.0
 
-  def setDefaultParameters(self, parameterNode):
-    """
-    Initialize parameter node with default settings.
-    """
-    if not parameterNode.GetParameter("Threshold"):
-      parameterNode.SetParameter("Threshold", "100.0")
-    if not parameterNode.GetParameter("Invert"):
-      parameterNode.SetParameter("Invert", "false")
+    self.AutomaticUpdate = True
+    self.SliceVisibility= True
 
-  def process(self, inputVolume, outputVolume, imageThreshold, invert=False, showResult=True):
-    """
-    Run the processing algorithm.
-    Can be used without GUI widget.
-    :param inputVolume: volume to be thresholded
-    :param outputVolume: thresholding result
-    :param imageThreshold: values above/below this threshold will be set to 0
-    :param invert: if True then values above the threshold will be set to 0, otherwise values below are set to 0
-    :param showResult: show output volume in slice viewers
-    """
+    self.CurvePoly = None
+    self.interpResolution = 25
+    self.CurveLength = -1.0  ## Length of the curve (<0 means 'not measured')
+    self.transformMatrix= vtk.vtkMatrix4x4()
+    self.entryID=0
+    self.targetID=1
+    self.transformNode = slicer.vtkMRMLTransformNode()
+    slicer.mrmlScene.AddNode(self.transformNode)
 
-    if not inputVolume or not outputVolume:
-      raise ValueError("Input or output volume is invalid")
+  def setJumpToEntryPoint(self):
+    slicer.modules.markups.logic().JumpSlicesToNthPointInMarkup(self.PlanNode.GetID(), self.entryID)
 
-    import time
-    startTime = time.time()
-    logging.info('Processing started')
+  def setJumpToTargetPoint(self):
+    slicer.modules.markups.logic().JumpSlicesToNthPointInMarkup(self.PlanNode.GetID(), self.targetID)
 
-    # Compute the thresholded output volume using the "Threshold Scalar Volume" CLI module
-    cliParams = {
-      'InputVolume': inputVolume.GetID(),
-      'OutputVolume': outputVolume.GetID(),
-      'ThresholdValue' : imageThreshold,
-      'ThresholdType' : 'Above' if invert else 'Below'
-      }
-    cliNode = slicer.cli.run(slicer.modules.thresholdscalarvolume, None, cliParams, wait_for_completion=True, update_display=showResult)
-    # We don't need the CLI module node anymore, remove it to not clutter the scene with it
-    slicer.mrmlScene.RemoveNode(cliNode)
+  def setTubeRadius(self, radius):
+    self.TubeRadius = radius
+    self.updateCurve()  
 
-    stopTime = time.time()
-    logging.info('Processing completed in {0:.2f} seconds'.format(stopTime-startTime))
+  def generateCurveOnce(self):
+    prevAutomaticUpdate = self.AutomaticUpdate
+    self.AutomaticUpdate = True
+    self.updateCurve()
+    self.AutomaticUpdate = prevAutomaticUpdate
 
-#
-# TrajectoryTest
-#
+  def controlPointsUpdated(self,caller,event):
+    self.updateCurve()
 
-class TrajectoryTest(ScriptedLoadableModuleTest):
-  """
-  This is the test case for your scripted module.
-  Uses ScriptedLoadableModuleTest base class, available at:
-  https://github.com/Slicer/Slicer/blob/master/Base/Python/slicer/ScriptedLoadableModule.py
-  """
+  def setVolumeReslicer(self, state):
+    if state:
+      n0= numpy.zeros(3)
+      n1= numpy.zeros(3)
+      self.PlanNode.GetNthControlPointPosition(self.entryID, n0)
+      self.PlanNode.GetNthControlPointPosition(self.targetID, n1)
+      v= (n0-n1)/ numpy.linalg.norm(n1-n0)
+      x= numpy.random.randn(3)
+      x= x- x.dot(v) *v
+      x/= numpy.linalg.norm(x)
+      y= numpy.cross(v,x)
+      y=numpy.append(y,numpy.zeros(1))
+      y= numpy.append(y,numpy.append(x,numpy.zeros(1)) )
+      y= numpy.append(y, numpy.append(v,numpy.zeros(1)))
+      y= numpy.append(y, numpy.identity(4)[:,3], axis=0)
+      y=numpy.reshape(y, (4,4))
+      y= numpy.transpose(y)
+      for i in range(0, 4):
+            for j in range(0, 4):
+                self.transformMatrix.SetElement(i, j, y[i, j])
 
-  def setUp(self):
-    """ Do whatever is needed to reset the state - typically a scene clear will be enough.
-    """
-    slicer.mrmlScene.Clear()
+    else:
+      identity=numpy.identity(4)
+      for i in range(0, 4):
+            for j in range(0, 4):
+                self.transformMatrix.SetElement(i, j, identity[i, j])
+    self.setTransform()
+    
+  def setTransform(self):
+    VolumeNode=slicer.mrmlScene.GetNthNodeByClass(0,"vtkMRMLScalarVolumeNode")
+    VolumeNode.SetAndObserveTransformNodeID(self.transformNode.GetID())
+    self.transformNode.SetMatrixTransformToParent(self.transformMatrix)
+    layoutManager = slicer.app.layoutManager()
+    for sliceViewName in layoutManager.sliceViewNames():
+      layoutManager.sliceWidget(sliceViewName).mrmlSliceNode().RotateToVolumePlane(VolumeNode)
+      layoutManager.sliceWidget(sliceViewName).sliceController().setSliceVisible(True)
+    self.setJumpToTargetPoint()
+    
 
-  def runTest(self):
-    """Run as few or as many tests as needed here.
-    """
-    self.setUp()
-    self.test_Trajectory1()
+  def nodeToPolyCardinalSpline(self, PlanNode, outputPoly):
 
-  def test_Trajectory1(self):
-    """ Ideally you should have several levels of tests.  At the lowest level
-    tests should exercise the functionality of the logic with different inputs
-    (both valid and invalid).  At higher levels your tests should emulate the
-    way the user would interact with your code and confirm that it still works
-    the way you intended.
-    One of the most important features of the tests is that it should alert other
-    developers when their changes will have an impact on the behavior of your
-    module.  For example, if a developer removes a feature that you depend on,
-    your test should break so they know that the feature is needed.
-    """
+    nOfControlPoints = PlanNode.GetNumberOfFiducials()
+    pos = [0.0, 0.0, 0.0]
 
-    self.delayDisplay("Starting the test")
+    # One spline for each direction.
+    aSplineX = vtk.vtkCardinalSpline()
+    aSplineY = vtk.vtkCardinalSpline()
+    aSplineZ = vtk.vtkCardinalSpline()
 
-    # Get/create input data
+    aSplineX.ClosedOff()
+    aSplineY.ClosedOff()
+    aSplineZ.ClosedOff()
 
-    import SampleData
-    registerSampleData()
-    inputVolume = SampleData.downloadSample('Trajectory1')
-    self.delayDisplay('Loaded test data set')
+    for i in range(0, nOfControlPoints):
+      PlanNode.GetNthFiducialPosition(i, pos)
+      aSplineX.AddPoint(i, pos[0])
+      aSplineY.AddPoint(i, pos[1])
+      aSplineZ.AddPoint(i, pos[2])
+    
+    # Interpolate x, y and z by using the three spline filters and
+    # create new points
+    nInterpolatedPoints = (self.interpResolution+2)*(nOfControlPoints-1) # One section is divided into self.interpResolution segments
+    points = vtk.vtkPoints()
+    r = [0.0, 0.0]
+    aSplineX.GetParametricRange(r)
+    t = r[0]
+    p = 0
+    tStep = (nOfControlPoints-1.0)/(nInterpolatedPoints-1.0)
+    nOutputPoints = 0
 
-    inputScalarRange = inputVolume.GetImageData().GetScalarRange()
-    self.assertEqual(inputScalarRange[0], 0)
-    self.assertEqual(inputScalarRange[1], 695)
+    while t < r[1]:
+      points.InsertPoint(p, aSplineX.Evaluate(t), aSplineY.Evaluate(t), aSplineZ.Evaluate(t))
+      t = t + tStep
+      p = p + 1
+    nOutputPoints = p
+    
+    lines = vtk.vtkCellArray()
+    lines.InsertNextCell(nOutputPoints)
+    for i in range(0, nOutputPoints):
+      lines.InsertCellPoint(i)
+        
+    outputPoly.SetPoints(points)
+    outputPoly.SetLines(lines)
 
-    outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-    threshold = 100
+  def pathToPoly(self, path, poly):
+    points = vtk.vtkPoints()
+    cellArray = vtk.vtkCellArray()
 
-    # Test the module logic
+    points = vtk.vtkPoints()
+    poly.SetPoints(points)
 
-    logic = TrajectoryLogic()
+    lines = vtk.vtkCellArray()
+    poly.SetLines(lines)
 
-    # Test algorithm with non-inverted threshold
-    logic.process(inputVolume, outputVolume, threshold, True)
-    outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-    self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-    self.assertEqual(outputScalarRange[1], threshold)
+    linesIDArray = lines.GetData()
+    linesIDArray.Reset()
+    linesIDArray.InsertNextTuple1(0)
+    
+    polygons = vtk.vtkCellArray()
+    poly.SetPolys( polygons )
+    idArray = polygons.GetData()
+    idArray.Reset()
+    idArray.InsertNextTuple1(0)
+    
+    for point in path:
+      pointIndex = points.InsertNextPoint(*point)
+      linesIDArray.InsertNextTuple1(pointIndex)
+      linesIDArray.SetTuple1( 0, linesIDArray.GetNumberOfTuples() - 1 )
+      lines.SetNumberOfCells(1)
 
-    # Test algorithm with inverted threshold
-    logic.process(inputVolume, outputVolume, threshold, False)
-    outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-    self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-    self.assertEqual(outputScalarRange[1], inputScalarRange[1])
+  def calculateLineLength(self, poly):
+    lines = poly.GetLines()
+    points = poly.GetPoints()
+    pts = vtk.vtkIdList()
 
-    self.delayDisplay('Test passed')
+    lines.GetCell(0, pts)
+    ip = numpy.array(points.GetPoint(pts.GetId(0)))
+    n = pts.GetNumberOfIds()
+
+    # Check if there is overlap between the first and last segments
+    # (for making sure to close the loop for spline curves)
+    if n > 2:
+      slp = numpy.array(points.GetPoint(pts.GetId(n-2)))
+      # Check distance between the first point and the second last point
+      if numpy.linalg.norm(slp-ip) < 0.00001:
+        n = n - 1
+        
+    length = 0.0
+    pp = ip
+    for i in range(1,n):
+      p = numpy.array(points.GetPoint(pts.GetId(i)))
+      length = length + numpy.linalg.norm(pp-p)
+      pp = p
+
+    return length
+
+  def updateCurve(self):
+
+    # if self.AutomaticUpdate == False:
+    #   return
+
+    if self.PlanNode and self.PathNode:
+
+      if self.PlanNode.GetNumberOfFiducials() < 2:
+        if self.CurvePoly != None:
+          self.CurvePoly.Initialize()
+
+        self.CurveLength = 0.0
+
+      else:
+        if self.CurvePoly == None:
+          self.CurvePoly = vtk.vtkPolyData()
+        
+        if self.PathNode.GetDisplayNodeID() == None:
+          modelDisplayNode = slicer.vtkMRMLModelDisplayNode()
+          self.ModelColor = numpy.random.randint(0,9,3)  #Generate a list of 3 random element for the color of model
+          modelDisplayNode.SetColor(self.ModelColor)
+          slicer.mrmlScene.AddNode(modelDisplayNode)
+          modelDisplayNode.SetVisibility2D(self.SliceVisibility) #Set the 2D visibility of the model in the slices
+          self.PathNode.SetAndObserveDisplayNodeID(modelDisplayNode.GetID())
+
+        # Cardinal Spline
+        self.nodeToPolyCardinalSpline(self.PlanNode, self.CurvePoly)
+        self.CurveLength = self.calculateLineLength(self.CurvePoly)
+
+      tubeFilter = vtk.vtkTubeFilter()
+      curvatureValues = vtk.vtkDoubleArray()
+
+      tubeFilter.SetInputData(self.CurvePoly)
+      tubeFilter.SetRadius(self.TubeRadius)
+      tubeFilter.SetNumberOfSides(20)
+      tubeFilter.CappingOn()
+      tubeFilter.Update()
+
+      self.PathNode.SetAndObservePolyData(tubeFilter.GetOutput())
+      self.PathNode.Modified()
+      
+      if self.PathNode.GetScene() == None:
+        slicer.mrmlScene.AddNode(self.PathNode)
+
+      displayNode = self.PathNode.GetDisplayNode()
+      if displayNode:
+        displayNode.SetActiveScalarName('')
+
+  def distanceToPoint(self, point, extrapolate):
+
+    # distanceToPoint() calculates the approximate minimum distance between
+    # the specified point and the closest segment of the curve.
+    # It calculates the minimum distance between the point and each segment
+    # of the curve (approxmated as a straight line) and select the segment with
+    # the minimum distance from the point as a closest segment.
+
+    npoint = numpy.array(point)
+
+    if self.CurvePoly == None:
+      return numpy.Inf
+
+    lines = self.CurvePoly.GetLines()
+    points = self.CurvePoly.GetPoints()
+    pts = vtk.vtkIdList()
+
+    lines.GetCell(0, pts)
+    ip = numpy.array(points.GetPoint(pts.GetId(0)))
+    n = pts.GetNumberOfIds()
+
+    # First point on the segment
+    p1 = ip
+
+    minMag2 = numpy.Inf
+    minIndex = -1
+    minErrVec = numpy.array([0.0, 0.0, 0.0])
+
+    errVec = numpy.array([0.0, 0.0, 0.0])
+    for i in range(1,n):
+      # Second point on the segment
+      p2 = numpy.array(points.GetPoint(pts.GetId(i)))
+
+      # Normal vector along the segment
+      nvec = p2-p1
+      norm = numpy.linalg.norm(nvec)
+      if norm != 0:
+        nnvec = nvec / norm
+
+      # Calculate the distance between the point and the segment
+      mag2 = 0.0
+
+      op = npoint - p1
+      aproj = numpy.inner(op, nnvec)
+
+      if extrapolate and ((i == 1 and aproj < 0.0) or (i == n-1 and aproj > 0.0)):
+        # extrapolate first or last segment
+        errVec = op-aproj*nnvec  # perpendicular
+        mag2 = numpy.inner(errVec,errVec) # magnitude^2
+      else:
+        if aproj < 0.0:
+          errVec = npoint - p1
+          mag2 = numpy.inner(errVec, errVec) # magnitude^2
+        elif aproj > norm:
+          errVec = npoint - p2
+          mag2 = numpy.inner(errVec, errVec) # magnitude^2
+        else:
+          errVec = op-aproj*nnvec # perpendicular
+          mag2 = numpy.inner(errVec,errVec) # magnitude^2
+        
+      if mag2 < minMag2:
+        minMag2 = mag2
+        minIndex = i
+        minErrVec = errVec
+    
+      p1 = p2
+
+    distance = numpy.sqrt(minMag2)
+
+    return (distance, minErrVec)
