@@ -19,7 +19,7 @@ class Trajectory(ScriptedLoadableModule):
     self.parent.title = "Trajectory"  
     self.parent.categories = ["Informatics"]  
     self.parent.dependencies = ["CurveMaker"]  
-    self.parent.contributors = ["Xyz (Alpha Corp.)"]  
+    self.parent.contributors = ["Ajay Kumar Sahu (Inspire Lab)"]  
     self.parent.helpText = """
     This extension helps us to mark trajectory for needle incision.
     See more information in <a href="https://github.com/ajaykumarsahu0505/Slicer3D/tree/main/Trajectory%20mapper">module documentation</a>."""
